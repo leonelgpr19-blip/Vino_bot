@@ -18,10 +18,9 @@ MAKE_WEBHOOK    = os.getenv("MAKE_WEBHOOK_URL", "")
 
 CLABE           = os.getenv("CLABE", "012345678901234567")
 BANCO           = os.getenv("BANCO", "BBVA")
-BENEFICIARIO    = os.getenv("BENEFICIARIO", "TU BODEGA SA DE CV")
+BENEFICIARIO    = os.getenv("BENEFICIARIO", "Leodan Perez Velasques")
 
 DB_PATH         = os.getenv("DB_PATH", "bot.db")
-
 # ---- Flask ----
 app = Flask(__name__)
 
