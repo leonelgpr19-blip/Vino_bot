@@ -2,12 +2,12 @@
 # WhatsApp Cloud API + Flask + SQLite
 # Flujo con confirmación ("sí/no") y expiración de sesión
 
-import os, re, sqlite3
+import os, re, sqlite3, json
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import requests
-import os
+
 load_dotenv()
 
 # ---- ENV ----
@@ -57,6 +57,7 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 with db() as conn:
     conn.executescript(SCHEMA)
 
@@ -69,8 +70,10 @@ def normalize(s: str) -> str:
 
 def now_iso():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 def in_minutes(m: int):
     return (datetime.utcnow() + timedelta(minutes=m)).strftime("%Y-%m-%d %H:%M:%S")
+
 def in_hours(h: int):
     return (datetime.utcnow() + timedelta(hours=h)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -115,39 +118,60 @@ def resolve_alias(ntext: str) -> str:
 
 # ---- WhatsApp API helpers ----
 def wa_url():
-    return f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
-HEADERS = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
+    # v21.0 (estable al día de hoy)
+    return f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages"
+
+HEADERS = {
+    "Authorization": f"Bearer {WA_TOKEN}",
+    "Content-Type": "application/json"
+}
 
 def send_wa_text(to: str, text: str):
-    requests.post(wa_url(), headers=HEADERS, json={
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text[:4096]}
-    }, timeout=30)
+    try:
+        r = requests.post(wa_url(), headers=HEADERS, json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": text[:4096]}
+        }, timeout=30)
+        print("WA SEND TEXT =>", r.status_code, r.text)
+    except Exception as e:
+        print("Error send_wa_text:", e)
 
 def send_wa_buttons(to: str, body: str, buttons: list):
     btns = [{"type":"reply","reply":{"id":bid,"title":btitle}} for bid,btitle in buttons][:3]
-    requests.post(wa_url(), headers=HEADERS, json={
-        "messaging_product":"whatsapp",
-        "to": to,
-        "type":"interactive",
-        "interactive":{"type":"button","body":{"text": body[:1024]},"action":{"buttons": btns}}
-    }, timeout=30)
+    try:
+        r = requests.post(wa_url(), headers=HEADERS, json={
+            "messaging_product":"whatsapp",
+            "to": to,
+            "type":"interactive",
+            "interactive":{
+                "type":"button",
+                "body":{"text": body[:1024]},
+                "action":{"buttons": btns}
+            }
+        }, timeout=30)
+        print("WA SEND BTNS =>", r.status_code, r.text)
+    except Exception as e:
+        print("Error send_wa_buttons:", e)
 
 def ask_city(to: str):
-    send_wa_buttons(to, "👋 ¿En qué ciudad te encuentras?", [("cdmx","CDMX"), ("qro","Querétaro"), ("otra","Otra")])
+    send_wa_buttons(to, "👋 ¿En qué ciudad te encuentras?",
+                    [("cdmx","CDMX"), ("qro","Querétaro"), ("otra","Otra")])
+
 def show_menu(to: str):
     send_wa_buttons(to, "Menú principal:\n• Características\n• Precio\n• Comprar",
                     [("caracteristicas","Características"), ("precios","Precio"), ("comprar","Comprar")])
+
 def ask_close_or_continue(to: str):
-    send_wa_buttons(to, "¿Deseas *seguir comprando* o *cerrar* la conversación?", [("seguir","Seguir"), ("cerrar","Cerrar")])
+    send_wa_buttons(to, "¿Deseas seguir comprando o cerrar la conversación?",
+                    [("seguir","Seguir"), ("cerrar","Cerrar")])
 
 FEATURES_MSG = (
     "Tenemos:\n"
-    "• *Vino Tinto Scala – Tempranillo* 🍷\n"
+    "• Vino Tinto Scala – Tempranillo 🍷\n"
     "  100% Tempranillo (Valle de la Grulla, Ensenada). Frutal, dulce y equilibrado.\n\n"
-    "• *Vino Espumoso Scala – Moscatel de Alejandría* 🍾\n"
+    "• Vino Espumoso Scala – Moscatel de Alejandría 🍾\n"
     "  Fresco, floral y afrutado, de burbuja fina. Ideal para mariscos, postres y celebraciones.\n"
 )
 PRICES_MSG = (
@@ -162,7 +186,7 @@ def payment_instructions(total: float, order_id: int) -> str:
         f"💳 Depósito/transferencia a:\n"
         f"{BANCO}\nBeneficiario: {BENEFICIARIO}\nCLABE: {CLABE}\n"
         f"Concepto: Pedido {order_id}\n\n"
-        "📸 Cuando tengas el comprobante, envía la foto aquí o escribe *PAGADO*."
+        "📸 Cuando tengas el comprobante, envía la foto aquí o escribe PAGADO."
     )
 
 # ---- Webhook (GET verify + POST receive) ----
@@ -171,6 +195,7 @@ def webhook_verify():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
+    print("VERIFY GET =>", mode, token, challenge)
     if mode == "subscribe" and token == WA_VERIFY_TOKEN:
         return challenge, 200
     return "forbidden", 403
@@ -179,11 +204,14 @@ def webhook_verify():
 def webhook_receive():
     data = request.get_json(force=True, silent=True) or {}
     try:
+        print("INCOMING EVENT =>", json.dumps(data, ensure_ascii=False))
         entry = data.get("entry",[{}])[0]
         changes = entry.get("changes",[{}])[0]
         value = changes.get("value",{})
         messages = value.get("messages",[])
         contacts = value.get("contacts",[{}])
+
+        # Si no hay mensajes, devolver OK (Meta no reintenta)
         if not messages:
             return jsonify(ok=True)
 
@@ -198,47 +226,59 @@ def webhook_receive():
             conn.execute("UPDATE states SET last_msg_at=? WHERE phone=?", (now_iso(), from_num))
 
         with db() as conn:
-            st = conn.execute("SELECT state,city,wine,qty,last_msg_at,close_by FROM states WHERE phone=?", (from_num,)).fetchone()
+            st = conn.execute("SELECT state,city,wine,qty,last_msg_at,close_by FROM states WHERE phone=?",
+                              (from_num,)).fetchone()
         current_state = st["state"] if st else None
         current_city  = st["city"]  if st else None
 
         # Expirada o cerrada
         if expired_session(st) or (current_state == "closed"):
-            send_wa_text(from_num, "La sesión anterior finalizó ✅\nEscribe *hola* para empezar una nueva compra 🍷")
+            send_wa_text(from_num, "La sesión anterior finalizó ✅\nEscribe hola para empezar una nueva compra 🍷")
             with db() as conn:
                 mark_closed(conn, from_num)
             return jsonify(ok=True)
 
-        # Tipo de mensaje
+        # Tipo de mensaje y extracción de texto
         mtype = msg.get("type")
-        text_raw = msg.get("text",{}).get("body","") if mtype=="text" else ""
+        text_raw = ""
+        if mtype == "text":
+            text_raw = msg.get("text",{}).get("body","") or ""
+        elif mtype == "button":
+            text_raw = msg.get("button",{}).get("text","") or ""
+        elif mtype == "interactive":
+            itype = msg.get("interactive",{}).get("type")
+            if itype == "button_reply":
+                text_raw = msg["interactive"]["button_reply"].get("title","") or ""
+            elif itype == "list_reply":
+                text_raw = msg["interactive"]["list_reply"].get("title","") or ""
+
         ntext = normalize(text_raw)
 
         # ---- Interactive (botones)
         if mtype=="interactive":
             itype = msg.get("interactive",{}).get("type")
             if itype=="button_reply":
-                bid = msg["interactive"]["button_reply"]["id"]
+                bid = msg["interactive"]["button_reply"].get("id","")
 
                 # Cerrar / Seguir
                 if bid == "cerrar":
                     with db() as conn: mark_closed(conn, from_num)
-                    send_wa_text(from_num, "Conversación finalizada. ¡Gracias por tu compra! 🍇\nEscribe *hola* para iniciar otra.")
+                    send_wa_text(from_num, "Conversación finalizada. ¡Gracias por tu compra! 🍇\nEscribe hola para iniciar otra.")
                     return jsonify(ok=True)
                 if bid == "seguir":
-                    with db() as conn: conn.execute("UPDATE states SET state='menu', close_by=NULL WHERE phone=?", (from_num,))
+                    with db() as conn: conn.execute("UPDATE states SET state='menu', close_by=NULL WHERE phone=?",(from_num,))
                     show_menu(from_num); return jsonify(ok=True)
 
                 # Ciudad
                 if bid in ("cdmx","qro","otra"):
                     with db() as conn:
                         if bid=="otra":
-                            send_wa_text(from_num, "Por ahora solo entregamos en *CDMX y Querétaro*. ¡Pronto más ciudades! 🙏")
+                            send_wa_text(from_num, "Por ahora solo entregamos en CDMX y Querétaro. ¡Pronto más ciudades! 🙏")
                             mark_closed(conn, from_num); return jsonify(ok=True)
                         city = "cdmx" if bid=="cdmx" else "queretaro"
                         conn.execute("UPDATE states SET state='menu', city=?, close_by=NULL WHERE phone=?", (city, from_num))
                         conn.execute("UPDATE customers SET city=? WHERE phone=?", (city, from_num))
-                    send_wa_text(from_num, f"¡Perfecto! Entregas personales en *{ 'CDMX' if city=='cdmx' else 'Querétaro' }* 🍷")
+                    send_wa_text(from_num, f"¡Perfecto! Entregas personales en { 'CDMX' if city=='cdmx' else 'Querétaro' } 🍷")
                     show_menu(from_num); return jsonify(ok=True)
 
                 # Menú
@@ -254,7 +294,7 @@ def webhook_receive():
                             conn.execute("UPDATE states SET state='ask_city', close_by=NULL WHERE phone=?", (from_num,))
                             return jsonify(ok=True)
                         conn.execute("UPDATE states SET state='ask_name', close_by=? WHERE phone=?", (in_minutes(30), from_num))
-                    send_wa_text(from_num, "Perfecto. ¿Cuál es tu *nombre completo*?")
+                    send_wa_text(from_num, "Perfecto. ¿Cuál es tu nombre completo?")
                     return jsonify(ok=True)
 
         # ---- Texto: arranque / cierre manual
@@ -263,7 +303,7 @@ def webhook_receive():
             ask_city(from_num); return jsonify(ok=True)
         if mtype=="text" and any(k in ntext for k in ["cerrar","gracias","no gracias","listo"]):
             with db() as conn: mark_closed(conn, from_num)
-            send_wa_text(from_num, "Conversación finalizada. Escribe *hola* para empezar de nuevo 🍷")
+            send_wa_text(from_num, "Conversación finalizada. Escribe hola para empezar de nuevo 🍷")
             return jsonify(ok=True)
 
         # ---- Flujo guiado
@@ -276,7 +316,7 @@ def webhook_receive():
             with db() as conn:
                 conn.execute("UPDATE customers SET name=? WHERE phone=?", (text_raw.strip(), from_num))
                 conn.execute("UPDATE states SET state='ask_email', close_by=? WHERE phone=?", (in_minutes(30), from_num))
-            send_wa_text(from_num, "Gracias. ¿Cuál es tu *correo electrónico*?")
+            send_wa_text(from_num, "Gracias. ¿Cuál es tu correo electrónico?")
             return jsonify(ok=True)
 
         if current_state=="ask_email" and mtype=="text":
@@ -298,12 +338,12 @@ def webhook_receive():
                 return jsonify(ok=True)
             with db() as conn:
                 conn.execute("UPDATE states SET state='ask_qty', wine=?, close_by=? WHERE phone=?", (wine_key, in_minutes(30), from_num))
-            send_wa_text(from_num, f"Anotado: *{title_wine(wine_key)}*. ¿Cuántas botellas deseas?")
+            send_wa_text(from_num, f"Anotado: {title_wine(wine_key)}. ¿Cuántas botellas deseas?")
             return jsonify(ok=True)
 
         # 5) Cantidad → muestra RESUMEN y pasa a confirming
         if current_state == "ask_qty" and mtype == "text":
-            qty = int(re.sub(r"\D", "", text_raw)) if re.search(r"\d+", text_raw) else 1
+            qty = int(re.search(r"\d+", text_raw).group()) if re.search(r"\d+", text_raw) else 1
             with db() as conn:
                 row = conn.execute("SELECT wine, city FROM states WHERE phone=?", (from_num,)).fetchone()
                 wine_key = row["wine"]; city = row["city"]
@@ -312,8 +352,9 @@ def webhook_receive():
                 return jsonify(ok=True)
             price = CATALOG[wine_key]; total = qty * price; wine_name = title_wine(wine_key)
             with db() as conn:
-                conn.execute("UPDATE states SET state='confirming', qty=?, close_by=? WHERE phone=?", (qty, in_minutes(30), from_num))
-            msg = (f"📝 *Resumen de tu pedido:*\n"
+                conn.execute("UPDATE states SET state='confirming', qty=?, close_by=? WHERE phone=?",
+                             (qty, in_minutes(30), from_num))
+            msg = (f"📝 Resumen de tu pedido:\n"
                    f"• Vino: {wine_name}\n"
                    f"• Cantidad: {qty} botella(s)\n"
                    f"• Total: ${total} MXN\n\n"
@@ -331,7 +372,8 @@ def webhook_receive():
                     conn.execute("INSERT INTO orders(phone,city,wine,qty,total,status) VALUES(?,?,?,?,?,?)",
                                  (from_num, city, wine_key, qty, total, "awaiting_payment"))
                     order_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
-                    conn.execute("UPDATE states SET state='awaiting_payment', close_by=? WHERE phone=?", (in_hours(2), from_num))
+                    conn.execute("UPDATE states SET state='awaiting_payment', close_by=? WHERE phone=?",
+                                 (in_hours(2), from_num))
                 confirm_msg = (
                     f"🍷 ¡Excelente! Has confirmado tu pedido de {qty} {title_wine(wine_key)} "
                     f"por un total de ${total} MXN.\n\n{payment_instructions(total, order_id)}"
@@ -341,7 +383,7 @@ def webhook_receive():
 
             elif "no" in ntext:
                 with db() as conn: conn.execute("UPDATE states SET state='menu', close_by=NULL WHERE phone=?", (from_num,))
-                send_wa_text(from_num, "🛑 Pedido cancelado. Escribe *menu* para volver a empezar.")
+                send_wa_text(from_num, "🛑 Pedido cancelado. Escribe menu para volver a empezar.")
                 return jsonify(ok=True)
 
             else:
@@ -377,8 +419,10 @@ def webhook_receive():
                 "tipo_comprobante": mtype
             }
             if MAKE_WEBHOOK:
-                try: requests.post(MAKE_WEBHOOK, json=payload, timeout=30)
-                except Exception as e: print("Error POST Make:", e)
+                try:
+                    requests.post(MAKE_WEBHOOK, json=payload, timeout=30)
+                except Exception as e:
+                    print("Error POST Make:", e)
 
             send_wa_text(from_num, "¡Gracias! Recibimos tu comprobante ✅ En breve te contactaremos para coordinar la entrega 🍷")
             ask_close_or_continue(from_num)
@@ -389,7 +433,7 @@ def webhook_receive():
             show_menu(from_num); return jsonify(ok=True)
 
         # Fallback
-        send_wa_text(from_num, "No entendí eso 🤔. Escribe *hola* para empezar o usa los botones del menú.")
+        send_wa_text(from_num, "No entendí eso 🤔. Escribe hola para empezar o usa los botones del menú.")
         return jsonify(ok=True)
 
     except Exception as e:
@@ -401,5 +445,6 @@ def webhook_receive():
 def root():
     return "OK", 200
 
-if __name__ == "__main__":
+if __name__=="__main__":
+    # Render le asigna PORT; gunicorn lo usa en producción.
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
