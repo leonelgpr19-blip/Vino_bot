@@ -21,28 +21,10 @@ BANCO           = os.getenv("BANCO", "BBVA")
 BENEFICIARIO    = os.getenv("BENEFICIARIO", "Leodan Perez Velasques")
 
 DB_PATH         = os.getenv("DB_PATH", "bot.db")
+
 # ---- Flask ----
 app = Flask(__name__)
-@app.route('/webhook', methods=['GET'])
-def verify():
-    token = os.getenv("VERIFY_TOKEN")
-    mode = request.args.get("hub.mode")
-    challenge = request.args.get("hub.challenge")
-    verify_token = request.args.get("hub.verify_token")
 
-    if mode and verify_token:
-        if mode == "subscribe" and verify_token == token:
-            print("Webhook verified!")
-            return challenge, 200
-        else:
-            return "Verification failed", 403
-    return "Hello", 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json()
-    print(data)
-    return "EVENT_RECEIVED", 200
 # ---- DB ----
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS customers(
@@ -183,9 +165,9 @@ def payment_instructions(total: float, order_id: int) -> str:
         "📸 Cuando tengas el comprobante, envía la foto aquí o escribe *PAGADO*."
     )
 
-# ---- Webhook verification ----
-@app.get("/wa/webhook")
-def verify():
+# ---- Webhook (GET verify + POST receive) ----
+@app.route("/webhook", methods=["GET"])
+def webhook_verify():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -193,9 +175,8 @@ def verify():
         return challenge, 200
     return "forbidden", 403
 
-# ---- Webhook receiver ----
-@app.post("/wa/webhook")
-def receive():
+@app.route("/webhook", methods=["POST"])
+def webhook_receive():
     data = request.get_json(force=True, silent=True) or {}
     try:
         entry = data.get("entry",[{}])[0]
